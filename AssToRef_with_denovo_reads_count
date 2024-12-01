@@ -1,0 +1,211 @@
+import pandas as pd
+from Bio import SeqIO
+import subprocess
+import glob
+import sys
+from matplotlib import pyplot as plt
+import statistics
+import os
+import shutil
+from multiprocessing import Pool
+import time
+
+def worker(sample_name): 
+  reference_file = sys.argv[1]
+  # sample name setup
+  sample_name = sample_name.strip("\n")
+  if sample_name.split(".")[-2] == "fq":
+      # raw MGI data
+      num = sample_name.split(".")[0].split("_")[-1]
+  elif sample_name.split(".")[-2] == "fastq":
+      # raw Illumina or renamed data
+      num = sample_name.split(".")[0].split("_")[0]
+  os.mkdir(num)
+
+  # Calculate total reads
+  print("Calculating total reads for", num, time.ctime(time.time()))
+  count_cmd = f"zcat {sample_name} | wc -l | awk '{{print $1/4}}'"
+  total_reads = int(float(subprocess.check_output(count_cmd, shell=True).strip()))
+  print(f"Total reads for {num}: {total_reads}")
+
+  #fastp preprocessing step
+  print("Preprocessing data for", num, time.ctime(time.time()))
+  fastp_str = "fastp -i "+sample_name+" -o "+num+os.sep+num+"_trimmed.fastq.gz --fix_mgi_id -f 10 -g -5 -M 15 -l 50 -y -h "+num+os.sep+num+"_fastp_report.html -w 8"
+  subprocess.run(fastp_str, shell=True)
+
+
+  #first alignment step
+  print("First alignment for", num, time.ctime(time.time()))
+  #aln_str1 = "bwa index hiv-db.fasta"
+  #subprocess.run(aln_str1, shell=True)
+  aln_str2 = "bwa mem -k 17 -A1 -B1 -O1 -E1 -L0 -t 8 "+reference_file+" "+num+os.sep+num+"_trimmed.fastq.gz | samtools view -bS | samtools sort -o "+num+os.sep+num+".bam && samtools index "+num+os.sep+num+".bam && samtools idxstats "+num+os.sep+num+".bam > "+num+os.sep+num+"_idxstats.txt"
+  #aln_str2 = "minimap2 -aY -x sr -t 8 HRV_Full_genome.fasta "+sample_name+" | samtools view -bS | samtools sort -o "+num+os.sep+num+".bam && samtools index "+num+os.sep+num+".bam && samtools idxstats "+num+os.sep+num+".bam > "+num+os.sep+num+"_idxstats.txt"
+  subprocess.run(aln_str2, shell=True)
+
+  #parsing idxstats output and selecting best reference
+  print("Parsing idxstats for", num, time.ctime(time.time()))
+  df = pd.read_csv(num+os.sep+num+"_idxstats.txt", sep="\t", header=None)
+  df = df.dropna()
+  df.columns = ['seq_name', 'seq_length', 'mapped_reads', 'unmapped_reads']
+  df = df.sort_values(by='mapped_reads', ascending=False)
+  #df.iloc[0:5][['seq_name', 'mapped_reads']].values
+  for [n,c] in df.iloc[0:5][['seq_name', 'mapped_reads']].values: print(n,c)
+  best_ref = df.iloc[[0]]['seq_name'].values[0]
+  print("Best reference for "+num+" - "+str(best_ref)+". Mapped "+str(df.iloc[[0]]['mapped_reads'].values[0])+" reads")
+  for seq in SeqIO.parse(reference_file, 'fasta'):
+    if seq.id == df.iloc[[0]]['seq_name'].values[0]:
+      SeqIO.write(seq, num+os.sep+'ref.fasta', 'fasta')
+  df = df.sort_values(by='unmapped_reads', ascending=False)
+  print("Unmapped: ", df.iloc[0][['unmapped_reads']].values[0])
+  unmapped = df.iloc[0][['unmapped_reads']].values[0]
+  if os.path.exists(num+os.sep+num+".bam.bai") and os.path.exists(num+os.sep+num+".bam"):
+    os.remove(num+os.sep+num+".bam")
+    os.remove(num+os.sep+num+".bam.bai")
+
+  #run de novo assembly
+  print("Run de novo assembly for", num, time.ctime(time.time()))
+  dn_str = "megahit -r "+num+os.sep+num+"_trimmed.fastq.gz -t 8 -o "+num+os.sep+num+"_megahit"
+  subprocess.run(dn_str, shell=True)
+  shutil.copy(num+os.sep+num+"_megahit"+os.sep+"final.contigs.fa", num+os.sep+num+"_final.contigs.fa")
+  shutil.rmtree(num+os.sep+num+"_megahit", ignore_errors=True)
+
+  #map contigs to best reference
+  print("Map contigs to referrence and adjust reference for", num, time.ctime(time.time()))
+  mp_str1 = "minimap2 -aY -t 8 -x asm20 "+num+os.sep+"ref.fasta "+num+os.sep+num+"_final.contigs.fa | samtools view -bS -F 0x4 | samtools sort -o "+num+os.sep+num+"_ctg.bam && samtools index "+num+os.sep+num+"_ctg.bam"
+  subprocess.run(mp_str1, shell=True)
+  mp_str2 = "samtools faidx "+num+os.sep+"ref.fasta && bcftools mpileup --threads 8 -m 1 --indels-cns --indel-size 110 -Ou -f "+num+os.sep+"ref.fasta "+num+os.sep+num+"_ctg.bam | bcftools call --ploidy 1 -mv -Oz -o "+num+os.sep+num+"_ctg_calls.vcf.gz && bcftools index "+num+os.sep+num+"_ctg_calls.vcf.gz"
+  subprocess.run(mp_str2, shell=True)
+  mp_str3 = "bcftools consensus -f "+num+os.sep+"ref.fasta "+num+os.sep+num+"_ctg_calls.vcf.gz > "+num+os.sep+num+"_ctg_ref.fasta"
+  subprocess.run(mp_str3, shell=True)
+
+  #rerun alignment on modified best reference
+  print("Realign on best reference for", num, time.ctime(time.time()))
+  aln_str1 = "bwa index "+num+os.sep+num+"_ctg_ref.fasta"
+  subprocess.run(aln_str1, shell=True)
+  aln_str2 = "bwa mem -k 17 -A1 -B1 -O1 -E1 -L0 -t 8 "+num+os.sep+num+"_ctg_ref.fasta "+num+os.sep+num+"_trimmed.fastq.gz | samtools view -bS -F 0x4 | samtools sort -o "+num+os.sep+num+"_br.bam && samtools index "+num+os.sep+num+"_br.bam && samtools idxstats "+num+os.sep+num+"_br.bam > "+num+os.sep+num+"_br_idxstats.txt && cat "+num+os.sep+num+"_br_idxstats.txt"
+  #aln_str2 = "minimap2 -aY -x sr -t 8 "+num+os.sep+"ref.fasta "+sample_name+" | samtools view -bS -F 0x4 | samtools sort -o "+num+os.sep+num+"_br.bam && samtools index "+num+os.sep+num+"_br.bam && samtools idxstats "+num+os.sep+num+"_br.bam > "+num+os.sep+num+"_br_idxstats.txt && cat "+num+os.sep+num+"_br_idxstats.txt"
+  subprocess.run(aln_str2, shell=True)
+  
+
+  #get list of snps and indels
+  print("Get SNPs for", num, time.ctime(time.time()))
+  snp_str1 = "samtools faidx "+num+os.sep+num+"_ctg_ref.fasta" 
+  subprocess.run(snp_str1, shell=True)
+  snp_str2 = "lofreq viterbi -f "+num+os.sep+num+"_ctg_ref.fasta "+num+os.sep+num+"_br.bam | samtools sort - | lofreq indelqual --dindel -f "+num+os.sep+num+"_ctg_ref.fasta -o "+num+os.sep+num+"_br_cor.bam - " 
+  subprocess.run(snp_str2, shell=True)
+  snp_str3 = "samtools index "+num+os.sep+num+"_br_cor.bam"
+  subprocess.run(snp_str3, shell=True)
+  snp_str4 = "lofreq call-parallel --pp-threads 8 -f "+num+os.sep+num+"_ctg_ref.fasta -o "+num+os.sep+num+".vcf.gz --call-indels "+num+os.sep+num+"_br_cor.bam"
+  subprocess.run(snp_str4, shell=True)
+  #snp_str5 = "lofreq filter -i "+num+os.sep+num+".vcf.gz -o "+num+os.sep+num+"_filtered.vcf.gz -a 0.5"
+  snp_str5 = 'bcftools convert -e "INFO/AF < 0.5" -Oz -o '+num+os.sep+num+'_filtered.vcf.gz '+num+os.sep+num+'.vcf.gz'
+  subprocess.run(snp_str5, shell=True)
+  if os.path.exists(num+os.sep+num+"_br.bam.bai") and os.path.exists(num+os.sep+num+"_br.bam"):
+    os.remove(num+os.sep+num+"_br.bam")
+    os.remove(num+os.sep+num+"_br.bam.bai")
+
+  #apply snps and indels
+  print("Apply SNPs for", num, time.ctime(time.time()))
+  bcf_str1 = "bcftools index -f "+num+os.sep+num+"_filtered.vcf.gz"
+  subprocess.run(bcf_str1, shell=True)
+  bcf_str2 = "bcftools consensus -s - -f "+num+os.sep+num+"_ctg_ref.fasta -p "+num+"_ -o "+num+os.sep+num+"_int.fasta "+num+os.sep+num+"_filtered.vcf.gz"
+  subprocess.run(bcf_str2, shell=True)
+
+  #realign to new reference
+  print("Realign on final reference for", num, time.ctime(time.time()))
+  aln_str1 = "bwa index "+num+os.sep+num+"_int.fasta"
+  subprocess.run(aln_str1, shell=True)
+  aln_str2 = "bwa mem -k 17 -A1 -B1 -O1 -E1 -L0 -t 8 "+num+os.sep+num+"_int.fasta "+num+os.sep+num+"_trimmed.fastq.gz | samtools view -bS -F 0x4 | samtools sort -o "+num+os.sep+num+"_final.bam && samtools index "+num+os.sep+num+"_final.bam && samtools idxstats "+num+os.sep+num+"_final.bam > "+num+os.sep+num+"_final_idxstats.txt && cat "+num+os.sep+num+"_final_idxstats.txt"
+  #aln_str2 = "minimap2 -aY -x sr -t 8 "+num+os.sep+num+"_int.fasta "+sample_name+" | samtools view -bS -F 0x4 | samtools sort -o "+num+os.sep+num+"_final.bam && samtools index "+num+os.sep+num+"_final.bam && samtools idxstats "+num+os.sep+num+"_final.bam > "+num+os.sep+num+"_final_idxstats.txt && cat "+num+os.sep+num+"_final_idxstats.txt"
+  subprocess.run(aln_str2, shell=True)
+  with open(num+os.sep+num+"_final_idxstats.txt", "r") as idxstats:
+    mapped = idxstats.readline().split("\t")[2]
+
+  #calculate consensus and stats
+  print("Calculate final consensus for", num, time.ctime(time.time()))
+  #cons_str = "samtools consensus -a --min-BQ 15 -d 2 -o "+num+os.sep+num+"_final.fasta "+num+os.sep+num+"_final.bam"
+  cons_str = "samtools mpileup -aa -A -d 0 -Q 0 "+num+os.sep+num+"_final.bam | ivar consensus -p "+num+os.sep+num+"_final -q 15 -m 2 -i "+num
+  subprocess.run(cons_str, shell=True)
+  depth_str = "samtools depth -aa "+num+os.sep+num+"_final.bam > "+num+os.sep+num+"_depth.txt"
+  subprocess.run(depth_str, shell=True)
+  if os.path.exists(num+os.sep+num+"_trimmed.fastq.gz"):
+    os.remove(num+os.sep+num+"_trimmed.fastq.gz")
+
+  pos = []
+  cov = []
+  zeros = 0
+  ltthree = 0
+  lten = 0
+  with open(num+os.sep+num+"_depth.txt", 'r') as inf:
+    for line in inf:
+      s = line.split()
+      pos.append(int(s[1]))
+      cov.append(int(s[2]))
+      if int(s[2]) == 0:
+        zeros += 1
+      if int(s[2]) < 3:
+        ltthree +=1
+      if int(s[2]) < 10:
+        lten += 1
+  
+  plt.figure(figsize=(12.8, 4.8))
+  ax1 = plt.subplot(1, 1, 1)
+  ax1.semilogy(pos, cov)
+  ax1.set_title(num + ", median: " + str(statistics.median(cov)) + ", mean: " + str(round(statistics.mean(cov),1)))
+  ax1.set_xlabel("Position")
+  ax1.set_ylabel("Coverage")
+  ax1.grid()
+
+  ax1.legend(loc="upper left")
+  
+  plt.savefig(num+os.sep+num+'.png')
+  print("Median coverage: "+str(statistics.median(cov)))
+  print("Mean coverage: "+str(round(statistics.mean(cov),1)))
+  print("Zero-covered positions: "+str(zeros))
+  print("Coverage lower than 10: "+str(lten))
+  plt.close()
+  
+  for seq in SeqIO.parse(num+os.sep+num+"_final.fa", 'fasta'):
+    seq.id == str(num)+"_med_"+str(statistics.median(cov))+"_N_"+str(str(seq.seq).count("N"))
+    lgth = len(str(seq.seq))
+    SeqIO.write(seq, num+os.sep+num+"_final.fasta", 'fasta')
+
+  #write line to table
+  with open("stats.txt", "a") as tbl_file:
+    tbl_file.write(f"{num}\t{best_ref}\t{mapped}\t{unmapped}\t{statistics.median(cov)}\t{round(statistics.mean(cov),3)}\t{lgth}\t{zeros}\t{ltthree}\t{lten}\t{total_reads}\n")
+
+  #copy results
+  if os.path.isfile(num+os.sep+num+"_final.fasta"):
+    shutil.copy(num+os.sep+num+"_final.fasta", num+"_final.fasta")
+  if os.path.isfile(num+os.sep+num+'.png'):
+    shutil.copy(num+os.sep+num+'.png', num+'.png')
+  if os.path.isfile(num+os.sep+num+"_idxstats.txt"):
+    shutil.copy(num+os.sep+num+"_idxstats.txt", num+"_idxstats.txt")
+
+  #moving final files to the results directory
+    print("Moving files to results for", num, time.ctime(time.time()))
+    result_dir = "results"
+    if not os.path.exists(result_dir):
+        os.mkdir(result_dir)
+
+    for file_ext in ["*.png", "*_final.fasta", "stats.txt"]:
+        for file in glob.glob(num + os.sep + file_ext):
+            shutil.move(file, result_dir)
+
+    print("Completed processing for", num, time.ctime(time.time()))
+    return
+
+if __name__ == '__main__':
+  #print()
+  reference_file = sys.argv[1]
+  #with open("samples.txt", "r") as samp_file:
+    #samp_list = samp_file.readlines()
+  samples = glob.glob("*.fq.gz") + glob.glob("*.fastq.gz")
+  with open("stats.txt", "w") as tbl_file:
+    tbl_file.write("Sample\tBest_ref\tMapped\tUnmapped\tMedian_cov\tMean_cov\tLength\tZeros\tLt3\tLt10\tTotal_reads\n")
+  aln_str1 = "bwa index "+reference_file
+  subprocess.run(aln_str1, shell=True)
+  # запуск рабочих процессов по 8 потоков в каждом
+  with Pool(processes=int(os.cpu_count()//8)) as pool:
+    # результаты получим в порядке поступления задач
+    res = pool.map(worker, samples)
